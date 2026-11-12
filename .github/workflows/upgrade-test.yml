@@ -1,6 +1,6 @@
 name: bootc Upgrade and Rollback Test
-# Reusable workflow: post-build gate that boots the newly pushed image in QEMU
-# and runs the projectbluefin/testsuite lifecycle suite (upgrade + rollback).
+# Reusable workflow: post-build gate that boots the previous image in QEMU
+# and runs the projectbluefin/testsuite lifecycle suite against the candidate.
 #
 # Wire it after your build job and gate promotion on the result:
 #
@@ -9,7 +9,7 @@ name: bootc Upgrade and Rollback Test
 #     uses: projectbluefin/actions/.github/workflows/upgrade-test.yml@<pinned-ref>
 #     with:
 #       image: ghcr.io/your-org/your-image@${{ needs.build.outputs.digest }}
-#
+#       previous_image: ghcr.io/your-org/your-image@sha256:<previous-digest>
 #   promote:
 #     needs: upgrade-test
 #     if: needs.upgrade-test.outputs.result == 'success'
@@ -18,11 +18,6 @@ name: bootc Upgrade and Rollback Test
 # deployment, rollback to previous deployment, and /etc persistence.
 # See: https://github.com/projectbluefin/testsuite/blob/main/tests/lifecycle/features/bootc.feature
 #
-# NOTE: explicit from→to cross-version upgrade path testing requires testsuite
-# changes tracked in:
-#   https://github.com/projectbluefin/testsuite/issues/223  (target-image input)
-#   https://github.com/projectbluefin/testsuite/issues/222  (no-op upgrade guard)
-
 on:
   workflow_dispatch:
     inputs:
@@ -30,6 +25,10 @@ on:
         description: "Full OCI image reference (e.g. ghcr.io/ublue-os/bluefin:latest)"
         required: true
         default: "ghcr.io/ublue-os/bluefin:latest"
+      previous_image:
+        description: "Previous image pinned by digest; empty makes lifecycle qualification fail as a no-op"
+        required: false
+        default: ""
       suites:
         description: "Comma-separated suites (default: lifecycle)"
         required: false
@@ -49,6 +48,12 @@ on:
           Example (LTS):         ghcr.io/ublue-os/bluefin-lts:lts
         required: true
         type: string
+      previous_image:
+        description: >
+          Previous image from the same repository, pinned by digest. If empty,
+          lifecycle qualification fails because the upgrade is a no-op.
+        type: string
+        default: ""
       suites:
         description: >
           Comma-separated test suites to run.
@@ -80,29 +85,65 @@ on:
 permissions: {}
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate previous image
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          PREVIOUS_IMAGE: ${{ inputs.previous_image }}
+        run: |
+          if [[ -z "$PREVIOUS_IMAGE" ]]; then
+            exit 0
+          fi
+          if [[ ! "$PREVIOUS_IMAGE" =~ ^.+@sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::previous_image must be pinned by a sha256 digest"
+            exit 1
+          fi
+          if [[ "$PREVIOUS_IMAGE" == "$IMAGE" ]]; then
+            echo "::error::previous_image must differ from image"
+            exit 1
+          fi
+          previous_repo="${PREVIOUS_IMAGE%@*}"
+          if [[ "${previous_repo##*/}" == *:* ]]; then
+            previous_repo="${previous_repo%:*}"
+          fi
+          image_repo="${IMAGE%@*}"
+          if [[ "${image_repo##*/}" == *:* ]]; then
+            image_repo="${image_repo%:*}"
+          fi
+          if [[ "$previous_repo" != "$image_repo" ]]; then
+            echo "::error::previous_image and image must use the same repository"
+            exit 1
+          fi
+
   upgrade-test:
     name: Upgrade & rollback — ${{ inputs.image }}
+    needs: validate
     # Keep this pin identical to the testsuite e2e.yml pin in reusable-execute-release.yml
     # (same `# v1` comment) so Renovate bumps all callers together.
-    uses: projectbluefin/testsuite/.github/workflows/e2e.yml@87bdbafbc7de4d83744682144a4ea3494735d0b6 # v1
+    uses: projectbluefin/testsuite/.github/workflows/e2e.yml@a0623b29f658c15fc84c7c4653b94914f1d4a5d5 # v1
     permissions:
       contents: read
       packages: write
     with:
-      image: ${{ inputs.image }}
+      image: ${{ inputs.previous_image || inputs.image }}
+      target-image: ${{ inputs.previous_image && inputs.image || '' }}
       suites: ${{ inputs.suites || 'lifecycle' }}
       skip_native_apps: ${{ inputs.skip_native_apps || false }}
       screenshot_flatpaks: ${{ inputs.screenshot_flatpaks || '' }}
       chunked_enabled: ${{ inputs.chunked_enabled == true || inputs.chunked_enabled == 'true' }}
 
   report:
-    needs: upgrade-test
+    needs: [validate, upgrade-test]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
     outputs:
-      result: ${{ needs.upgrade-test.result }}
+      result: ${{ needs.validate.result == 'failure' && 'failure' || needs.upgrade-test.result }}
     steps:
       - run: echo "upgrade-test result=${{ needs.upgrade-test.result }}"

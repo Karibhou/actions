@@ -22,10 +22,10 @@ Post-build gate workflows for bootc image repos. Both workflows are part of the
 
 ## Upgrade test
 
-A post-build gate: after your image is built and pushed, call this workflow with
-the new image ref. It boots it in QEMU via `projectbluefin/testsuite` and runs the
-`lifecycle` suite — upgrade, reboot, rollback, `/etc` persistence, and idempotency.
-Only if the gate passes should the image be promoted or tagged stable.
+A post-build gate: boot a previous digest in QEMU, then stage the candidate via
+`projectbluefin/testsuite` and run the `lifecycle` suite — upgrade, reboot,
+rollback, `/etc` persistence, and idempotency. The previous and candidate images
+must be different builds from the same repository. Only promote after the gate passes.
 
 ### Minimal wiring — build → gate → promote
 
@@ -36,6 +36,7 @@ jobs:
     outputs:
       image: ${{ steps.push.outputs.registry-path }}/your-image
       digest: ${{ steps.push.outputs.digest }}
+      previous_digest: ${{ steps.previous.outputs.digest }} # retained before the build
 
   upgrade-test:
     needs: build
@@ -45,18 +46,27 @@ jobs:
       packages: write
     with:
       image: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+      previous_image: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.previous_digest }}
 
   promote:
     needs: upgrade-test
     if: needs.upgrade-test.outputs.result == 'success'
     # ... move tag, cut release, etc. ...
 ```
+Provide `previous_digest` from a build older than the candidate. For images with
+immutable dated tags, such as Utah's `testing-YYYYMMDD-<sha>`, select the newest
+tag older than the candidate and resolve it to a digest before calling the gate.
+Dakota does not publish dated tags, so its caller must retain the previous digest.
+Without `previous_image`, the candidate is booted as before, but lifecycle
+qualification fails because upgrading it to itself is a no-op.
+
 
 ### Inputs reference
 
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `image` | **yes** | — | Full OCI ref of the image to gate on — tag or digest (e.g. `ghcr.io/ublue-os/bluefin:stable` or `…@sha256:abc`) |
+| `previous_image` | no | `""` | Previous image in the same repository, pinned by SHA-256 digest; empty preserves the old boot behavior but fails lifecycle qualification |
 | `suites` | no | `lifecycle` | Comma-separated testsuite suites to run |
 | `skip_native_apps` | no | `false` | Skip `@native_app` scenarios |
 | `screenshot_flatpaks` | no | `""` | Comma-separated Flatpak IDs to launch-and-screenshot |
@@ -241,7 +251,7 @@ Do not use this skill to:
 ## Core Process
 
 1. **Build and push artifact**: Complete the container image build and obtain the immutable digest output.
-2. **Wire upgrade-test workflow**: Add a job invoking `projectbluefin/actions/.github/workflows/upgrade-test.yml@v1` passing the image digest.
+2. **Wire upgrade-test workflow**: Pass both the candidate image digest and the retained previous digest as `previous_image`.
 3. **Configure suites and options**: Set test suites (default `lifecycle`), flatpak screenshot lists, or native app flags as required by the image.
 4. **Gate promotion**: Ensure promotion jobs depend on `upgrade-test` output (`needs.upgrade-test.outputs.result == 'success'`).
 5. **Inspect failure artifacts**: If QEMU tests fail, download testsuite logs and screenshots from GitHub Actions artifacts for triage.
